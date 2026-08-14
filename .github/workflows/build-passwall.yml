@@ -1,0 +1,268 @@
+# =====================================================================
+# OpenWrt SDK PassWall 构建工作流
+# ---------------------------------------------------------------------
+# 流程: 下载 SDK -> 配置 PassWall feed -> 编译核心软件包 ->
+#       打包产物(含 sha256 校验) -> 上传 Artifacts / 发布 Releases
+#
+# 触发: 仅手动 (workflow_dispatch), 需仓库写权限
+# 修改: 见 env 区 (PKG_ARCH / SDK_TYPE / SDK_NAME / CORE_PKGS)
+# =====================================================================
+
+name: 构建 PassWall
+
+on:
+  workflow_dispatch:            # 仅手动触发
+
+concurrency:
+  group: passwall-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建 PassWall (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write           # 发布 Releases 所需
+
+    env:
+      # ---------- 平台与时间 ----------
+      PKG_ARCH: x86_64          # 定死 x86-64, 须与下方 SDK_NAME 匹配
+      TZ: Asia/Shanghai
+
+      # ---------- SDK 下载源 ----------
+      SDK_TYPE: releases/25.12.5            # 正式版; 开发版可改 snapshots
+      SDK_NAME: openwrt-sdk-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+
+      # ---------- PassWall 相关 feed ----------
+      FEED_PW_PKGS: src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main
+      FEED_PW_LUCI: src-git passwall_luci https://github.com/Openwrt-Passwall/openwrt-passwall.git;main
+      FEED_PW2_LUCI: src-git passwall2_luci https://github.com/Openwrt-Passwall/openwrt-passwall2.git;main
+
+      # ---------- 要编译的软件包 ----------
+      CORE_PKGS: luci-app-passwall luci-app-passwall2 xray-core sing-box hysteria ipt2socks
+
+    steps:
+      # ==================== 1. 环境准备 ====================
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc binutils-gold bison build-essential ccache ecj fastjar file flex g++ \
+            gawk gettext git help2man libbsd-dev libelf-dev liblzma-dev libncurses-dev \
+            libssl-dev meson mold mtd-utils ninja-build pbzip2 pigz pkg-config \
+            python3-dev python3-setuptools rsync subversion swig texinfo time \
+            u-boot-tools unzip wget xsltproc xxd zlib1g-dev zstd \
+            clang gcc-multilib g++-multilib
+
+      # runner 预装大量无关软件, 清理以免编译大包时磁盘耗尽
+      - name: 清理 runner 磁盘空间
+        run: |
+          echo "== 清理前磁盘 =="
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/lib/mono
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          echo "== 清理后磁盘 =="
+          df -h /
+
+      # ==================== 2. 获取 SDK ====================
+      - name: 下载并校验 SDK
+        working-directory: ${{ github.workspace }}
+        run: |
+          # 记录构建开始时间(epoch 秒), 供最终统计总用时
+          echo "BUILD_START=$(date +%s)" >> "$GITHUB_ENV"
+
+          # 注意: URL 须在 shell 内拼接(env 中的 ${VAR} 不会被二次展开)
+          SDK_URL="https://downloads.openwrt.org/${SDK_TYPE}/targets/x86/64/${SDK_NAME}"
+          SDK_SUMS_URL="https://downloads.openwrt.org/${SDK_TYPE}/targets/x86/64/sha256sums"
+
+          echo "== 下载校验文件与 SDK =="
+          wget -q "$SDK_SUMS_URL"
+          wget -q "$SDK_URL"
+
+          echo "== 校验 sha256 =="
+          EXPECTED=$(grep "${SDK_NAME}\$" sha256sums | awk '{print $1}')
+          ACTUAL=$(sha256sum "$SDK_NAME" | awk '{print $1}')
+          test "$EXPECTED" = "$ACTUAL" || { echo "错误: SHA256 校验失败"; exit 1; }
+          echo "OK: SHA256 校验通过"
+
+          echo "== 解压 SDK =="
+          tar --zstd -xf "$SDK_NAME"
+          test -d "${SDK_NAME%.tar.zst}" || { echo "错误: SDK 解压失败"; exit 1; }
+
+          # 导出 SDK 目录名, 供后续步骤定位工作目录
+          echo "SDK_DIR=${SDK_NAME%.tar.zst}" >> "$GITHUB_ENV"
+
+      # ================ 3. 配置 feed 与 .config ================
+      - name: 配置并更新 feed
+        working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
+        run: |
+          # 幂等地追加 passwall feed(已存在的行不重复添加)
+          SED_PART=""
+          for FEED in "$FEED_PW_PKGS" "$FEED_PW_LUCI" "$FEED_PW2_LUCI"; do
+            FEED_NAME=$(printf '%s' "$FEED" | awk '{print $2}')
+            if ! grep -qE "^[[:space:]]*src-git ${FEED_NAME}([[:space:]]|\$)" feeds.conf.default; then
+              SED_PART="${SED_PART:+$SED_PART\\n}${FEED}"
+            fi
+          done
+          if [ -n "$SED_PART" ]; then
+            SED_SCRIPT=$(printf '1i\\%s' "$SED_PART")
+            sed -i "$SED_SCRIPT" feeds.conf.default
+          fi
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config
+        working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
+        run: |
+          # 基础保护: 禁止自动构建全部包
+          echo "CONFIG_ALL_NONSHARED=n" > .config
+          echo "CONFIG_ALL_KMODS=n" >> .config
+          echo "CONFIG_ALL=n" >> .config
+          echo "CONFIG_AUTOREMOVE=n" >> .config
+
+          # 语言: 仅编入简体中文
+          echo "CONFIG_LUCI_LANG_fa=n" >> .config
+          echo "CONFIG_LUCI_LANG_ru=n" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hant=n" >> .config
+
+          # 目标包
+          echo "CONFIG_PACKAGE_luci-app-passwall=m" >> .config
+          echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
+
+          make defconfig
+
+      # ================ 4. 下载与编译 ================
+      # 首次执行在 workflow 中静默进行(无 V=s、不记日志);
+      # 首次失败的包交给 scripts/pkg-run.sh 重试一次(开 V=s), 日志写入 failed_logs/
+      - name: 下载源码包
+        working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
+        run: |
+          set -o pipefail
+          RETRY=""
+          for p in $CORE_PKGS; do
+            echo "== 下载: $p =="
+            if make -j$(nproc) "package/${p}/download"; then
+              echo "OK: $p"
+            else
+              echo "首次失败, 待重试: $p"
+              RETRY="${RETRY} $p"
+            fi
+          done
+          # 对首次失败的包执行重试(开 V=s, 记日志)
+          CORE_PKGS="$RETRY" bash ${{ github.workspace }}/scripts/pkg-run.sh download "download_"
+
+      - name: 编译软件包
+        working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
+        run: |
+          set -o pipefail
+          RETRY=""
+          for p in $CORE_PKGS; do
+            echo "== 编译: $p =="
+            if make -j$(nproc) "package/${p}/compile"; then
+              echo "OK: $p"
+            else
+              echo "首次失败, 待重试: $p"
+              RETRY="${RETRY} $p"
+            fi
+          done
+          # 对首次失败的包执行重试(开 V=s, 记日志)
+          CORE_PKGS="$RETRY" bash ${{ github.workspace }}/scripts/pkg-run.sh compile ""
+
+      # 失败包的日志已写入 failed_logs/, 无条件上传供定位
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: 编译日志-BuildLogs
+          path: ${{ github.workspace }}/${{ env.SDK_DIR }}/failed_logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ==================== 5. 产物处理 ====================
+      - name: 打包产物并生成校验
+        working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
+        run: |
+          # 展示实际编译出的 apk 列表
+          echo "== 编译产物 =="
+          for FEED in "$FEED_PW_PKGS" "$FEED_PW_LUCI" "$FEED_PW2_LUCI"; do
+            feed=$(printf '%s' "$FEED" | awk '{print $2}')
+            find "bin/packages/${PKG_ARCH}/${feed}" -maxdepth 1 -name "*.apk" 2>/dev/null \
+              || echo "$feed 无 .apk"
+          done
+
+          # 收集各 feed 的 apk, 平铺到暂存目录
+          TS=$(date '+%Y%m%d-%H%M%S')
+          ARCHIVE_NAME="Passwall_${PKG_ARCH}_${TS}.tar.gz"
+          STAGE_DIR="${ARCHIVE_NAME%.tar.gz}"
+          mkdir -p "${STAGE_DIR}" dist
+          ANY_APK=0
+          for FEED in "$FEED_PW_PKGS" "$FEED_PW_LUCI" "$FEED_PW2_LUCI"; do
+            feed=$(printf '%s' "$FEED" | awk '{print $2}')
+            src="bin/packages/${PKG_ARCH}/${feed}"
+            if [ -d "$src" ] && compgen -G "$src/*.apk" >/dev/null; then
+              cp "$src"/*.apk "${STAGE_DIR}/"
+              ANY_APK=1
+            else
+              echo "跳过(无 .apk): ${feed}"
+            fi
+          done
+          test "$ANY_APK" -ne 0 || { echo "错误: 未找到任何编译产物"; exit 1; }
+
+          # 汇总 apk 的 sha256 + 压缩包自身的 .sha256
+          (cd "${STAGE_DIR}" && sha256sum *.apk > sha256sums)
+          tar -czf "${ARCHIVE_NAME}" "${STAGE_DIR}"
+          rm -rf "${STAGE_DIR}"
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          mv "${ARCHIVE_NAME}" "${ARCHIVE_NAME}.sha256" dist/
+
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+
+      # ==================== 6. 上传 ====================
+      - name: 上传构建产物 (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: passwall-${{ env.ARCHIVE_NAME }}
+          path: ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # 统计构建总用时, 供 Release 说明展示
+      - name: 统计构建用时
+        run: |
+          NOW=$(date +%s)
+          SECS=$(( NOW - BUILD_START ))
+          if [ "$SECS" -lt 60 ]; then
+            DURATION="${SECS} 秒"
+          else
+            DURATION="$(( SECS / 60 )) 分 $(( SECS % 60 )) 秒"
+          fi
+          echo "BUILD_DURATION=${DURATION}" >> "$GITHUB_ENV"
+
+      # 发布到 GitHub Releases
+      - name: 发布到 GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: passwall-${{ env.ARCHIVE_NAME }}
+          files: ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/*
+          body: |
+            PassWall 自动构建产物 (${{ env.PKG_ARCH }})
+
+            | 项目 | 值 |
+            | --- | --- |
+            | SDK 版本 | ${{ env.SDK_TYPE }} |
+            | SDK | `${{ env.SDK_NAME }}` |
+            | 编译包 | `${{ env.CORE_PKGS }}` |
+            | 构建用时 | ${{ env.BUILD_DURATION }} |
+          draft: false
+          prerelease: false
+          overwrite_files: true

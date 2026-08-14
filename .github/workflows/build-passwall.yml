@@ -45,7 +45,7 @@ jobs:
     steps:
       # ==================== 1. 环境准备 ====================
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装构建依赖
         run: |
@@ -181,7 +181,7 @@ jobs:
       # 失败包的日志已写入 failed_logs/, 无条件上传供定位
       - name: 上传编译日志
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: 编译日志-BuildLogs
           path: ${{ github.workspace }}/${{ env.SDK_DIR }}/failed_logs/
@@ -229,7 +229,7 @@ jobs:
 
       # ==================== 6. 上传 ====================
       - name: 上传构建产物 (Artifacts)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: passwall-${{ env.ARCHIVE_NAME }}
           path: ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/
@@ -250,7 +250,7 @@ jobs:
 
       # 发布到 GitHub Releases
       - name: 发布到 GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: passwall-${{ env.ARCHIVE_NAME }}
           files: ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/*

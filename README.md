@@ -188,7 +188,7 @@ Get-Content sha256sums | ForEach-Object {
 
 | 资源 | 链接 |
 | --- | --- |
-| OpenWrt 官方下载 | <https://downloads.openwrt.org> |
+| OpenWrt 官方 | [openwrt.org](https://downloads.openwrt.org) |
 | OpenWrt-PassWall 项目 | [openwrt-passwall](https://github.com/Openwrt-Passwall/openwrt-passwall) |
 | OpenWrt-PassWall2 项目 | [openwrt-passwall2](https://github.com/Openwrt-Passwall/openwrt-passwall2) |
 

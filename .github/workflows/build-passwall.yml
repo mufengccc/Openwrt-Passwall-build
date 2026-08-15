@@ -27,7 +27,7 @@ jobs:
 
     env:
       # ---------- 平台与时间 ----------
-      PKG_ARCH: x86_64          # 定死 x86-64, 须与下方 SDK_NAME 匹配
+      PKG_ARCH: x86_64          # 固定为 x86-64, 须与下方 SDK_NAME 匹配
       TZ: Asia/Shanghai
 
       # ---------- SDK 下载源 ----------
@@ -136,7 +136,7 @@ jobs:
           echo "CONFIG_ALL=n" >> .config
           echo "CONFIG_AUTOREMOVE=n" >> .config
 
-          # 语言: 仅编入简体中文
+          # 语言: 默认仅编入简体中文; 需要其他语言时按需在下方增补对应 CONFIG_LUCI_LANG_* 行
           echo "CONFIG_LUCI_LANG_fa=n" >> .config
           echo "CONFIG_LUCI_LANG_ru=n" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
@@ -207,7 +207,7 @@ jobs:
 
           # 收集各 feed 的 apk, 平铺到暂存目录
           TS=$(date '+%Y%m%d-%H%M%S')
-          ARCHIVE_NAME="Passwall_${PKG_ARCH}_${TS}.tar.gz"
+          ARCHIVE_NAME="Passwall-${PKG_ARCH}-${TS}.tar.gz"
           STAGE_DIR="${ARCHIVE_NAME%.tar.gz}"
           mkdir -p "${STAGE_DIR}" dist
           ANY_APK=0
@@ -230,11 +230,12 @@ jobs:
           echo "== 产物清单 (校验值 包全名) =="
           cat "${STAGE_DIR}/sha256sums"
           # 导出 markdown 表格行, 供 Release 说明展示
+          # 用 printf 组织内容, 避免在双引号字符串内发生变量/反引号意外展开
           {
             echo "PKG_ROWS<<EOF"
             while read -r sum name; do
               [ -n "${name:-}" ] || continue
-              echo "| 🧊 ${name} | \`${sum}\` |"
+              printf '| 🧊 %s | `%s` |\n' "$name" "$sum"
             done < "${STAGE_DIR}/sha256sums"
             echo "EOF"
           } >> "$GITHUB_ENV"
@@ -246,12 +247,13 @@ jobs:
           mv "${ARCHIVE_NAME}" "${ARCHIVE_NAME}.sha256" dist/
 
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+          echo "ARCHIVE_TAG=${ARCHIVE_NAME%.tar.gz}" >> "$GITHUB_ENV"
 
       # ==================== 6. 上传 ====================
       - name: 上传构建产物 (Artifacts)
         uses: actions/upload-artifact@v7
         with:
-          name: passwall-${{ env.ARCHIVE_NAME }}
+          name: ${{ env.ARCHIVE_TAG }}
           path: ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/
           if-no-files-found: error
           retention-days: 7
@@ -272,8 +274,10 @@ jobs:
       - name: 发布到 GitHub Releases
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: passwall-${{ env.ARCHIVE_NAME }}
-          files: ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/*
+          tag_name: ${{ env.ARCHIVE_TAG }}
+          files: |
+            ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/Passwall-*.tar.gz
+            ${{ github.workspace }}/${{ env.SDK_DIR }}/dist/Passwall-*.tar.gz.sha256
           body: |
             PassWall 自动构建产物 (${{ env.PKG_ARCH }})
 
@@ -288,6 +292,26 @@ jobs:
             | 包全名 | SHA256 |
             | --- | --- |
             ${{ env.PKG_ROWS }}
+
+            ### 📦 安装说明
+
+            1. 将压缩包上传到路由器, 解压出所有内容到 tmp 文件夹, 进入该目录:
+
+               ```bash
+               cd tmp
+               ```
+
+            2. 安装所有 apk (将一并安装 luci-app-passwall、luci-app-passwall2、ipt2socks, 以及核心组件 xray-core、sing-box、hysteria):
+
+               ```bash
+               apk add --allow-untrusted ./*.apk
+               ```
+
+            3. 完成后还需安装以下内核模块 (用于 nftables 透明代理, 来自官方源, 需内核版本匹配):
+
+               ```bash
+               apk add kmod-nft-socket kmod-nft-tproxy
+               ```
           draft: false
           prerelease: false
           overwrite_files: true

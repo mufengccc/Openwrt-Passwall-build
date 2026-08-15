@@ -87,9 +87,15 @@ jobs:
           wget -q "$SDK_SUMS_URL"
           wget -q "$SDK_URL"
 
+          # wget -q 失败不报错, 显式检查两个文件是否真实下载成功
+          test -s sha256sums || { echo "错误: 校验文件 sha256sums 下载失败"; exit 1; }
+          test -s "$SDK_NAME" || { echo "错误: SDK 下载失败"; exit 1; }
+
           echo "== 校验 sha256 =="
-          EXPECTED=$(grep "${SDK_NAME}\$" sha256sums | awk '{print $1}')
+          EXPECTED=$(grep -F "${SDK_NAME}" sha256sums | awk '{print $1}')
+          test -n "$EXPECTED" || { echo "错误: sha256sums 中未找到 ${SDK_NAME}"; exit 1; }
           ACTUAL=$(sha256sum "$SDK_NAME" | awk '{print $1}')
+          test -n "$ACTUAL" || { echo "错误: 无法计算 SDK 校验值"; exit 1; }
           test "$EXPECTED" = "$ACTUAL" || { echo "错误: SHA256 校验失败"; exit 1; }
           echo "OK: SHA256 校验通过"
 
@@ -135,48 +141,42 @@ jobs:
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hant=n" >> .config
 
-          # 目标包
+          # 目标包: 与 env.CORE_PKGS 保持一致
           echo "CONFIG_PACKAGE_luci-app-passwall=m" >> .config
           echo "CONFIG_PACKAGE_luci-app-passwall2=m" >> .config
+          echo "CONFIG_PACKAGE_xray-core=m" >> .config
+          echo "CONFIG_PACKAGE_sing-box=m" >> .config
+          echo "CONFIG_PACKAGE_hysteria=m" >> .config
+          echo "CONFIG_PACKAGE_ipt2socks=m" >> .config
 
           make defconfig
 
       # ================ 4. 下载与编译 ================
-      # 首次执行在 workflow 中静默进行(无 V=s、不记日志);
-      # 首次失败的包交给 scripts/pkg-run.sh 重试一次(开 V=s), 日志写入 failed_logs/
+      # 首次执行: 一次并行 make 拉起全部核心包(含自动带出的强依赖), 静默进行;
+      # 并行失败则交给 scripts/pkg-run.sh 对全部包重试一次(开 V=s), 日志入 failed_logs/
       - name: 下载源码包
         working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
         run: |
-          set -o pipefail
-          RETRY=""
-          for p in $CORE_PKGS; do
-            echo "== 下载: $p =="
-            if make -j$(nproc) "package/${p}/download"; then
-              echo "OK: $p"
-            else
-              echo "首次失败, 待重试: $p"
-              RETRY="${RETRY} $p"
-            fi
-          done
-          # 对首次失败的包执行重试(开 V=s, 记日志)
-          CORE_PKGS="$RETRY" bash ${{ github.workspace }}/scripts/pkg-run.sh download "download_"
+          set -euo pipefail
+          echo "== 并行下载: $CORE_PKGS =="
+          if make -j"$(nproc)" $(for p in $CORE_PKGS; do echo "package/${p}/download"; done); then
+            echo "全部成功"
+          else
+            echo "并行下载有失败, 逐包重试(开 V=s, 记日志)"
+            bash ${{ github.workspace }}/scripts/pkg-run.sh download "download_"
+          fi
 
       - name: 编译软件包
         working-directory: ${{ github.workspace }}/${{ env.SDK_DIR }}
         run: |
-          set -o pipefail
-          RETRY=""
-          for p in $CORE_PKGS; do
-            echo "== 编译: $p =="
-            if make -j$(nproc) "package/${p}/compile"; then
-              echo "OK: $p"
-            else
-              echo "首次失败, 待重试: $p"
-              RETRY="${RETRY} $p"
-            fi
-          done
-          # 对首次失败的包执行重试(开 V=s, 记日志)
-          CORE_PKGS="$RETRY" bash ${{ github.workspace }}/scripts/pkg-run.sh compile ""
+          set -euo pipefail
+          echo "== 并行编译: $CORE_PKGS =="
+          if make -j"$(nproc)" $(for p in $CORE_PKGS; do echo "package/${p}/compile"; done); then
+            echo "全部成功"
+          else
+            echo "并行编译有失败, 逐包重试(开 V=s, 记日志)"
+            bash ${{ github.workspace }}/scripts/pkg-run.sh compile ""
+          fi
 
       # 失败包的日志已写入 failed_logs/, 无条件上传供定位
       - name: 上传编译日志
@@ -196,8 +196,12 @@ jobs:
           echo "== 编译产物 =="
           for FEED in "$FEED_PW_PKGS" "$FEED_PW_LUCI" "$FEED_PW2_LUCI"; do
             feed=$(printf '%s' "$FEED" | awk '{print $2}')
-            find "bin/packages/${PKG_ARCH}/${feed}" -maxdepth 1 -name "*.apk" 2>/dev/null \
-              || echo "$feed 无 .apk"
+            src="bin/packages/${PKG_ARCH}/${feed}"
+            if [ -d "$src" ] && compgen -G "$src/*.apk" >/dev/null; then
+              find "$src" -maxdepth 1 -name "*.apk"
+            else
+              echo "${feed} 无 .apk"
+            fi
           done
 
           # 收集各 feed 的 apk, 平铺到暂存目录
@@ -218,8 +222,23 @@ jobs:
           done
           test "$ANY_APK" -ne 0 || { echo "错误: 未找到任何编译产物"; exit 1; }
 
-          # 汇总 apk 的 sha256 + 压缩包自身的 .sha256
+          # 生成 apk 校验清单 (sha256sums)
+          # 每行为最终产物: 第一列 sha256 校验值, 第二列包全名(含版本)
           (cd "${STAGE_DIR}" && sha256sum *.apk > sha256sums)
+
+          echo "== 产物清单 (校验值 包全名) =="
+          cat "${STAGE_DIR}/sha256sums"
+          # 导出 markdown 表格行, 供 Release 说明展示
+          {
+            echo "PKG_ROWS<<EOF"
+            while read -r sum name; do
+              [ -n "${name:-}" ] || continue
+              echo "| 🧊 ${name} | \`${sum}\` |"
+            done < "${STAGE_DIR}/sha256sums"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          cp "${STAGE_DIR}/sha256sums" dist/
           tar -czf "${ARCHIVE_NAME}" "${STAGE_DIR}"
           rm -rf "${STAGE_DIR}"
           sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
@@ -261,8 +280,13 @@ jobs:
             | --- | --- |
             | SDK 版本 | ${{ env.SDK_TYPE }} |
             | SDK | `${{ env.SDK_NAME }}` |
-            | 编译包 | `${{ env.CORE_PKGS }}` |
             | 构建用时 | ${{ env.BUILD_DURATION }} |
+
+            ### 包含的软件包
+
+            | 包全名 | SHA256 |
+            | --- | --- |
+            ${{ env.PKG_ROWS }}
           draft: false
           prerelease: false
           overwrite_files: true

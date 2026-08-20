@@ -295,19 +295,40 @@ jobs:
 
             ### 📦 安装说明
 
-            1. 将压缩包上传到路由器, 解压出所有内容到 tmp 文件夹, 进入该目录:
+            以下操作在 **OpenWrt 路由器** 上执行：
+
+            1. 更新索引并进入临时目录:
 
                ```bash
-               cd tmp
+               apk update
+               cd /tmp
                ```
 
-            2. 安装所有 apk (将一并安装 luci-app-passwall、luci-app-passwall2、ipt2socks, 以及核心组件 xray-core、sing-box、hysteria):
+            2. 下载压缩包与校验文件, 校验压缩包完整性 (需 `wget` 支持 HTTPS, 官方固件默认支持):
+
+               ```bash
+               wget -O ${{ env.ARCHIVE_NAME }} https://github.com/${{ github.repository }}/releases/download/${{ env.ARCHIVE_TAG }}/${{ env.ARCHIVE_NAME }}
+               wget -O ${{ env.ARCHIVE_NAME }}.sha256 https://github.com/${{ github.repository }}/releases/download/${{ env.ARCHIVE_TAG }}/${{ env.ARCHIVE_NAME }}.sha256
+               sha256sum -c ${{ env.ARCHIVE_NAME }}.sha256
+               ```
+
+               > 若输出 `FAILED`, 说明下载不完整或被篡改, 请删除文件后重新下载。
+
+            3. 解压并校验包内 apk:
+
+               ```bash
+               tar -xvzf ${{ env.ARCHIVE_NAME }}
+               cd ${{ env.ARCHIVE_TAG }}
+               sha256sum -c sha256sums
+               ```
+
+            4. 安装所有 apk (将一并安装 luci-app-passwall、luci-app-passwall2、ipt2socks, 以及核心组件 xray-core、sing-box、hysteria):
 
                ```bash
                apk add --allow-untrusted ./*.apk
                ```
 
-            3. 完成后还需安装以下内核模块 (用于 nftables 透明代理, 来自官方源, 需内核版本匹配):
+            5. 若需 nftables 透明代理内核模块 (来自官方源, 需内核版本匹配):
 
                ```bash
                apk add kmod-nft-socket kmod-nft-tproxy
